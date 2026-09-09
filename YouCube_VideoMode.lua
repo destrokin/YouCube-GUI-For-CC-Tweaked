@@ -3310,6 +3310,86 @@ drawButton(
         height = oldHeight
     end
 
+    -- =====================================================
+    -- VIDEO WEBSOCKET OWNERSHIP
+    -- =====================================================
+    -- The stock YouCube client opens its own WebSocket(s). If we simply
+    -- terminate the child program, CC:Tweaked may keep those native socket
+    -- handles alive until GC, eventually causing "Too many websockets".
+    --
+    -- We run ONLY the child YouCube program with a private `http` table whose
+    -- websocket() function records every handle it creates. Cleanup closes
+    -- ONLY those handles. Other programs/computers are never touched.
+    local ownedVideoSockets = {}
+    local ownedVideoSocketSet = {}
+
+    local function registerOwnedVideoSocket(socket)
+        if socket
+           and not ownedVideoSocketSet[socket] then
+
+            ownedVideoSocketSet[socket] = true
+            ownedVideoSockets[#ownedVideoSockets + 1] = socket
+        end
+
+        return socket
+    end
+
+    local function closeOwnedVideoSockets()
+        for i = #ownedVideoSockets, 1, -1 do
+            local socket = ownedVideoSockets[i]
+
+            if socket then
+                pcall(function()
+                    socket.close()
+                end)
+            end
+
+            ownedVideoSocketSet[socket] = nil
+            ownedVideoSockets[i] = nil
+        end
+
+        -- Give CC:Tweaked's scheduler a chance to release the native handles.
+        sleep(0)
+    end
+
+    local function runTrackedYouCube(programPath, ...)
+        local realWebsocket = http.websocket
+
+        local function trackedWebsocket(...)
+            local socket, err =
+                realWebsocket(...)
+
+            if socket then
+                registerOwnedVideoSocket(socket)
+            end
+
+            return socket, err
+        end
+
+        -- Keep YouCube in the normal CraftOS/shell environment. We replace
+        -- only http.websocket for the duration of this synchronous child run,
+        -- then restore the exact original function afterward.
+        http.websocket = trackedWebsocket
+
+        local args = {...}
+
+        local ok, result =
+            pcall(function()
+                return shell.run(
+                    programPath,
+                    table.unpack(args)
+                )
+            end)
+
+        http.websocket = realWebsocket
+
+        if not ok then
+            error(result, 0)
+        end
+
+        return result
+    end
+
     local function fetchVideoDuration(targetUrl)
         local okLib, youcubeapi =
             pcall(loadYouCubeApiLibrary)
@@ -3331,6 +3411,7 @@ drawButton(
         end
 
         socket = socketOrErr
+        registerOwnedVideoSocket(socket)
 
         local okApi, api =
             pcall(
@@ -3339,7 +3420,11 @@ drawButton(
             )
 
         if not okApi or not api then
-            pcall(function() socket.close() end)
+            pcall(function()
+                socket.close()
+            end)
+
+            ownedVideoSocketSet[socket] = nil
             return nil
         end
 
@@ -3376,6 +3461,15 @@ drawButton(
             socket.close()
         end)
 
+        ownedVideoSocketSet[socket] = nil
+
+        for i = #ownedVideoSockets, 1, -1 do
+            if ownedVideoSockets[i] == socket then
+                table.remove(ownedVideoSockets, i)
+                break
+            end
+        end
+
         return result
     end
 
@@ -3395,16 +3489,25 @@ drawButton(
         monitor.clear()
         monitor.setCursorPos(1,1)
 
-        local ok, err =
+        local ok, result =
             pcall(
-                shell.run,
+                runTrackedYouCube,
                 program,
                 search
             )
 
+        local err =
+            (not ok)
+            and result
+            or nil
+
         pcall(function()
             term.redirect(oldTerm)
         end)
+
+        -- Always close every WebSocket opened by THIS playback instance before
+        -- allowing the playlist/menu to continue.
+        closeOwnedVideoSockets()
 
         if not ok and action == "ended" then
             status =
@@ -3651,6 +3754,10 @@ drawButton(
     )
 
     stopAllSpeakers()
+
+    -- Idempotent safety cleanup: closes only sockets recorded for this
+    -- playYouCube() invocation.
+    closeOwnedVideoSockets()
 
     pcall(function()
         term.redirect(oldTerm)
