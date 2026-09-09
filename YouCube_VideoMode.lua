@@ -121,6 +121,7 @@ local activeAudioSocket = nil
 
 -- Prevent the normal Audio Only player from redrawing over queue/input screens.
 local audioOverlayLocked = false
+local videoLoadingLocked = false
 
 local serverOnline = false
 local serverStatusText = "CHECKING..."
@@ -680,6 +681,9 @@ local function drawMonitorSearch()
 end
 
 local function redrawAllControls()
+    if videoLoadingLocked then
+        return
+    end
     drawSearch()
 
     if monitor then
@@ -2470,6 +2474,9 @@ local function playAudioOnly(search, playlistInfo)
 end
 
 local function playYouCube(search, playlistInfo)
+    -- Keep the loading screen locked during ALL pre-playback setup.
+    -- We release this only when the actual video player GUI is drawn.
+    videoLoadingLocked = true
     if not monitor then
         status = "Connect an Advanced Monitor to play video."
         drawSearch()
@@ -3206,6 +3213,9 @@ local function playYouCube(search, playlistInfo)
         -- Repaint the live player immediately when leaving queue.
     
 
+    -- Pre-playback setup is complete. The video player GUI may now
+    -- replace the loading screen.
+    videoLoadingLocked = false
     drawTerminalVideoGui()
     end
 
@@ -3387,6 +3397,13 @@ drawButton(
             error(result, 0)
         end
 
+        if result == false then
+            error(
+                "YouCube client returned false while starting playback.",
+                0
+            )
+        end
+
         return result
     end
 
@@ -3509,12 +3526,18 @@ drawButton(
         -- allowing the playlist/menu to continue.
         closeOwnedVideoSockets()
 
-        if not ok and action == "ended" then
+        if not ok then
             status =
-                "YouCube error: "
-                .. tostring(err)
+                "Video failed to start: "
+                .. tostring(
+                    err
+                    or "Unknown YouCube/WebSocket error"
+                )
 
+            -- Never allow a startup/WebSocket failure to masquerade as a
+            -- completed playlist entry.
             action = "error"
+
         elseif action == "ended" then
             status = "Playback ended."
         end
@@ -3959,22 +3982,142 @@ local function playPlaylist(data)
         if action == "stop" then
             status = "Playlist stopped."
             return
+
+        elseif action == "error" then
+            -- A failed YouCube/WebSocket start is NOT "video finished".
+            -- Stop here instead of rapidly skipping every playlist entry.
+            return
+
         elseif action == "loop" then
             -- replay current index
 
-        else
+        elseif action == "next"
+            or action == "ended" then
+
             index = index + 1
+
+        else
+            status =
+                "Playback stopped: unexpected player result "
+                .. tostring(action)
+            return
         end
     end
 
     status = "Playlist finished."
 end
 
+local function drawVideoLoadingOn(target, title, detail)
+    if not target then
+        return
+    end
+
+    local oldDisplay = display
+    local oldWidth = width
+    local oldHeight = height
+
+    display = target
+    width, height = target.getSize()
+
+    restoreControllerPalette()
+
+    if display.setCursorBlink then
+        display.setCursorBlink(false)
+    end
+
+    display.setBackgroundColor(colors.black)
+    display.setTextColor(colors.white)
+    display.clear()
+
+    fillRect(1, 1, width, math.min(3, height), colors.blue)
+
+    centerText(
+        1,
+        "Y O U C U B E",
+        colors.white,
+        colors.blue
+    )
+
+    if height >= 2 then
+        centerText(
+            2,
+            "Video Player",
+            colors.lightBlue,
+            colors.blue
+        )
+    end
+
+    local centerY =
+        math.max(
+            4,
+            math.floor(height / 2) - 1
+        )
+
+    centerText(
+        centerY,
+        title or "LOADING VIDEO...",
+        colors.orange,
+        colors.black
+    )
+
+    if detail
+       and detail ~= ""
+       and centerY + 2 <= height then
+
+        centerText(
+            centerY + 2,
+            fitText(
+                detail,
+                math.max(1, width - 4)
+            ),
+            colors.lightGray,
+            colors.black
+        )
+    end
+
+    if centerY + 4 <= height then
+        centerText(
+            centerY + 4,
+            "Please wait...",
+            colors.gray,
+            colors.black
+        )
+    end
+
+    display = oldDisplay
+    width = oldWidth
+    height = oldHeight
+end
+
+local function drawVideoLoading(title, detail)
+    -- Give immediate visual confirmation on the Advanced Computer.
+    drawVideoLoadingOn(
+        controller,
+        title,
+        detail
+    )
+
+    -- Mirror the loading state to the monitor too, if one is connected.
+    if monitor then
+        if monitor.setTextScale then
+            monitor.setTextScale(GUI_SCALE)
+        end
+
+        drawVideoLoadingOn(
+            monitor,
+            title,
+            detail
+        )
+    end
+end
+
+
 local function playSearch(search)
     local submitted, submitError =
         normalizeMediaTarget(search)
 
     if not submitted then
+        videoLoadingLocked = false
         status = submitError
         return
     end
@@ -3982,14 +4125,49 @@ local function playSearch(search)
     -- Every submitted search/link starts a fresh playback session.
     audioOverlayLocked = false
 
+    -- IMPORTANT UX:
+    -- Draw a loading screen BEFORE doing playlist resolution, metadata lookup,
+    -- WebSocket setup, or launching YouCube. This makes PLAY feel immediate.
+    if not audioOnlyMode then
+        -- Prevent the outer mouse/key handler from immediately repainting the
+        -- keyboard over this loading screen.
+        videoLoadingLocked = true
+
+        if isPlaylistUrl(submitted) then
+            drawVideoLoading(
+                "LOADING PLAYLIST...",
+                "Resolving playlist..."
+            )
+        else
+            drawVideoLoading(
+                "LOADING VIDEO...",
+                "Preparing video..."
+            )
+        end
+
+        -- Yield once so CC:Tweaked has a chance to visibly flush the new GUI
+        -- before the slower networking/backend work begins.
+        sleep(0)
+    end
+
     if isPlaylistUrl(submitted) then
         local data, err =
             resolvePlaylist(submitted)
 
         if data and data.entries and #data.entries > 0 then
+            if not audioOnlyMode then
+                drawVideoLoading(
+                    "PLAYLIST READY",
+                    "Preparing 1 / "
+                    .. tostring(#data.entries)
+                )
+                sleep(0)
+            end
+
             playPlaylist(data)
         else
             status = tostring(err or "Playlist has no playable entries.")
+            videoLoadingLocked = false
         end
 
         return
@@ -4055,13 +4233,20 @@ local function playSearch(search)
 
             if action == "stop" then
                 break
+            elseif action == "error" then
+                break
             elseif action == "prev" then
                 index = math.max(1,index-1)
-            else
+            elseif action == "next"
+                or action == "ended" then
                 index = index + 1
+            else
+                break
             end
         end
     end
+    videoLoadingLocked = false
+
 end
 
 -- =========================================================
